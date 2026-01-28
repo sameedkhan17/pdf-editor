@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef, MouseEvent, TouchEvent } from 'react';
+import React, { useState, useEffect, useCallback, useRef, MouseEvent } from 'react';
 import { FileUploader } from '@/components/ui/file-uploader';
 import { Button } from '@/components/ui/button';
 import { PDFDocument } from 'pdf-lib';
@@ -60,6 +60,7 @@ const CropPDFPage = () => {
 
     const containerRef = useRef<HTMLDivElement>(null);
     const firstPageRef = useRef<HTMLDivElement>(null);
+    const pointerActiveRef = useRef<{ active: boolean; pointerId: number | null }>({ active: false, pointerId: null });
     const [pagesMounted, setPagesMounted] = useState(false);
 
     // Render all PDF pages to images
@@ -162,11 +163,19 @@ const CropPDFPage = () => {
     };
 
     // Touch handlers for mobile
-    const handleTouchStart = (e: TouchEvent, action: 'drag' | string) => {
+    const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>, action: 'drag' | string) => {
         e.stopPropagation();
+        if (pointerActiveRef.current.active) {
+            return;
+        }
+
+        // Note: We rely on touch-action: none in CSS to prevent scrolling
+        // e.preventDefault() is removed here as it causes issues with passive listeners
 
         const pageEl = document.querySelector('[data-crop-page]') as HTMLElement;
-        if (!pageEl) return;
+        if (!pageEl) {
+            return;
+        }
 
         const touch = e.touches[0];
         const rect = pageEl.getBoundingClientRect();
@@ -186,6 +195,48 @@ const CropPDFPage = () => {
             setIsDragging(true);
         } else {
             setIsResizing(action);
+        }
+    };
+
+    const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>, action: 'drag' | string) => {
+        if (e.pointerType !== 'touch') return;
+        e.stopPropagation();
+        if (e.cancelable) {
+            e.preventDefault();
+        }
+
+        pointerActiveRef.current = { active: true, pointerId: e.pointerId };
+
+        const pageEl = (e.currentTarget as HTMLElement).closest('[data-crop-page]') as HTMLElement
+            | null
+            | undefined
+            || firstPageRef.current;
+        if (!pageEl) {
+            return;
+        }
+
+        const rect = pageEl.getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 100;
+        const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+        setDragStart({
+            x,
+            y,
+            boxX: cropBox.x,
+            boxY: cropBox.y,
+            boxW: cropBox.width,
+            boxH: cropBox.height,
+        });
+
+        if (action === 'drag') {
+            setIsDragging(true);
+        } else {
+            setIsResizing(action);
+        }
+
+        const target = e.currentTarget as HTMLElement;
+        if (target.setPointerCapture) {
+            target.setPointerCapture(e.pointerId);
         }
     };
 
@@ -266,30 +317,41 @@ const CropPDFPage = () => {
         setIsResizing(null);
     }, []);
 
-    useEffect(() => {
-        const handleTouchMove = (e: globalThis.TouchEvent) => {
-            if (!isDragging && !isResizing) return;
-            e.preventDefault(); // Prevent scrolling while dragging
+    const handleTouchMove = (e: React.TouchEvent<HTMLDivElement> | TouchEvent) => {
+        if (pointerActiveRef.current.active) {
+            return;
+        }
+        if (!isDragging && !isResizing) {
+            return;
+        }
 
-            const touch = e.touches[0];
-            const pageEl = document.querySelector('[data-crop-page]') as HTMLElement;
-            if (!pageEl) return;
+        // Note: touch-action: none handles scroll prevention
 
-            const rect = pageEl.getBoundingClientRect();
-            const x = ((touch.clientX - rect.left) / rect.width) * 100;
-            const y = ((touch.clientY - rect.top) / rect.height) * 100;
+        const touch = e.touches[0];
+        const pageEl = document.querySelector('[data-crop-page]') as HTMLElement;
+        if (!pageEl) {
+            return;
+        }
 
-            const deltaX = x - dragStart.x;
-            const deltaY = y - dragStart.y;
+        const rect = pageEl.getBoundingClientRect();
+        const x = ((touch.clientX - rect.left) / rect.width) * 100;
+        const y = ((touch.clientY - rect.top) / rect.height) * 100;
 
-            if (isDragging) {
+        const deltaX = x - dragStart.x;
+        const deltaY = y - dragStart.y;
+
+        if (isDragging) {
+            setCropBox(prev => {
                 let newX = dragStart.boxX + deltaX;
                 let newY = dragStart.boxY + deltaY;
-                newX = Math.max(0, Math.min(100 - cropBox.width, newX));
-                newY = Math.max(0, Math.min(100 - cropBox.height, newY));
-                setCropBox(prev => ({ ...prev, x: newX, y: newY }));
-            } else if (isResizing) {
-                let newBox = { ...cropBox };
+                // Use dragStart values for constraints to avoid stale closure
+                newX = Math.max(0, Math.min(100 - dragStart.boxW, newX));
+                newY = Math.max(0, Math.min(100 - dragStart.boxH, newY));
+                return { ...prev, x: newX, y: newY };
+            });
+        } else if (isResizing) {
+            setCropBox(() => {
+                let newBox = { x: dragStart.boxX, y: dragStart.boxY, width: dragStart.boxW, height: dragStart.boxH };
                 switch (isResizing) {
                     case 'nw':
                         newBox.width = dragStart.boxW - deltaX;
@@ -330,26 +392,158 @@ const CropPDFPage = () => {
                 newBox.height = Math.max(5, Math.min(100, newBox.height));
                 newBox.x = Math.max(0, Math.min(100 - newBox.width, newBox.x));
                 newBox.y = Math.max(0, Math.min(100 - newBox.height, newBox.y));
-                setCropBox(newBox);
-            }
-        };
+                return newBox;
+            });
+        }
+    };
 
-        const handleTouchEnd = () => {
-            setIsDragging(false);
-            setIsResizing(null);
-        };
+    const handlePointerMove = useCallback((e: PointerEvent) => {
+        if (!isDragging && !isResizing) return;
+        if (e.pointerType !== 'touch') return;
+        if (!pointerActiveRef.current.active || pointerActiveRef.current.pointerId !== e.pointerId) return;
 
+        const pageEl = firstPageRef.current ?? document.querySelector('[data-crop-page]') as HTMLElement | null;
+        if (!pageEl) {
+            return;
+        }
+
+        const rect = pageEl.getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 100;
+        const y = ((e.clientY - rect.top) / rect.height) * 100;
+        const deltaX = x - dragStart.x;
+        const deltaY = y - dragStart.y;
+
+        if (isDragging) {
+            setCropBox(prev => {
+                let newX = dragStart.boxX + deltaX;
+                let newY = dragStart.boxY + deltaY;
+                newX = Math.max(0, Math.min(100 - dragStart.boxW, newX));
+                newY = Math.max(0, Math.min(100 - dragStart.boxH, newY));
+                return { ...prev, x: newX, y: newY };
+            });
+        } else if (isResizing) {
+            setCropBox(() => {
+                let newBox = { x: dragStart.boxX, y: dragStart.boxY, width: dragStart.boxW, height: dragStart.boxH };
+                switch (isResizing) {
+                    case 'nw':
+                        newBox.width = dragStart.boxW - deltaX;
+                        newBox.height = dragStart.boxH - deltaY;
+                        newBox.x = dragStart.boxX + deltaX;
+                        newBox.y = dragStart.boxY + deltaY;
+                        break;
+                    case 'ne':
+                        newBox.width = dragStart.boxW + deltaX;
+                        newBox.height = dragStart.boxH - deltaY;
+                        newBox.y = dragStart.boxY + deltaY;
+                        break;
+                    case 'sw':
+                        newBox.width = dragStart.boxW - deltaX;
+                        newBox.height = dragStart.boxH + deltaY;
+                        newBox.x = dragStart.boxX + deltaX;
+                        break;
+                    case 'se':
+                        newBox.width = dragStart.boxW + deltaX;
+                        newBox.height = dragStart.boxH + deltaY;
+                        break;
+                    case 'n':
+                        newBox.height = dragStart.boxH - deltaY;
+                        newBox.y = dragStart.boxY + deltaY;
+                        break;
+                    case 's':
+                        newBox.height = dragStart.boxH + deltaY;
+                        break;
+                    case 'w':
+                        newBox.width = dragStart.boxW - deltaX;
+                        newBox.x = dragStart.boxX + deltaX;
+                        break;
+                    case 'e':
+                        newBox.width = dragStart.boxW + deltaX;
+                        break;
+                }
+                newBox.width = Math.max(5, Math.min(100, newBox.width));
+                newBox.height = Math.max(5, Math.min(100, newBox.height));
+                newBox.x = Math.max(0, Math.min(100 - newBox.width, newBox.x));
+                newBox.y = Math.max(0, Math.min(100 - newBox.height, newBox.y));
+                return newBox;
+            });
+        }
+    }, [isDragging, isResizing, dragStart]);
+
+    const handleTouchEnd = () => {
+        if (pointerActiveRef.current.active) {
+            return;
+        }
+        setIsDragging(false);
+        setIsResizing(null);
+    };
+
+
+
+    useEffect(() => {
         window.addEventListener('mousemove', handleMouseMove);
         window.addEventListener('mouseup', handleMouseUp);
-        window.addEventListener('touchmove', handleTouchMove, { passive: false });
-        window.addEventListener('touchend', handleTouchEnd);
         return () => {
             window.removeEventListener('mousemove', handleMouseMove);
             window.removeEventListener('mouseup', handleMouseUp);
-            window.removeEventListener('touchmove', handleTouchMove);
-            window.removeEventListener('touchend', handleTouchEnd);
         };
-    }, [handleMouseMove, handleMouseUp, isDragging, isResizing, dragStart, cropBox]);
+    }, [handleMouseMove, handleMouseUp]);
+
+    useEffect(() => {
+        const handleWindowTouchMove = (e: TouchEvent) => {
+            if (!isDragging && !isResizing) return;
+            if (e.cancelable) {
+                e.preventDefault();
+            }
+            handleTouchMove(e);
+        };
+
+        const handleWindowTouchEnd = () => {
+            if (!isDragging && !isResizing) return;
+            handleTouchEnd();
+        };
+
+        window.addEventListener('touchmove', handleWindowTouchMove, { passive: false });
+        window.addEventListener('touchend', handleWindowTouchEnd, { passive: true });
+        window.addEventListener('touchcancel', handleWindowTouchEnd, { passive: true });
+
+        return () => {
+            window.removeEventListener('touchmove', handleWindowTouchMove);
+            window.removeEventListener('touchend', handleWindowTouchEnd);
+            window.removeEventListener('touchcancel', handleWindowTouchEnd);
+        };
+    }, [isDragging, isResizing]);
+
+
+
+    useEffect(() => {
+        const handleWindowPointerMove = (e: PointerEvent) => {
+            if (!isDragging && !isResizing) return;
+            if (e.pointerType !== 'touch') return;
+            if (!pointerActiveRef.current.active || pointerActiveRef.current.pointerId !== e.pointerId) return;
+            if (e.cancelable) {
+                e.preventDefault();
+            }
+            handlePointerMove(e);
+        };
+
+        const handleWindowPointerUp = (e: PointerEvent) => {
+            if (!isDragging && !isResizing) return;
+            if (e.pointerType !== 'touch') return;
+            if (!pointerActiveRef.current.active || pointerActiveRef.current.pointerId !== e.pointerId) return;
+            pointerActiveRef.current = { active: false, pointerId: null };
+            handleTouchEnd();
+        };
+
+        window.addEventListener('pointermove', handleWindowPointerMove, { passive: false });
+        window.addEventListener('pointerup', handleWindowPointerUp, { passive: true });
+        window.addEventListener('pointercancel', handleWindowPointerUp, { passive: true });
+
+        return () => {
+            window.removeEventListener('pointermove', handleWindowPointerMove);
+            window.removeEventListener('pointerup', handleWindowPointerUp);
+            window.removeEventListener('pointercancel', handleWindowPointerUp);
+        };
+    }, [isDragging, isResizing, handlePointerMove]);
 
     const handleDownload = async () => {
         if (!file) {
@@ -424,16 +618,21 @@ const CropPDFPage = () => {
 
                 {/* Crop box */}
                 <div
-                    className="absolute border-2 border-primary pointer-events-auto cursor-move"
+                    className="absolute border-2 border-primary pointer-events-auto cursor-move select-none"
                     style={{
                         left: `${cropBox.x}%`,
                         top: `${cropBox.y}%`,
                         width: `${cropBox.width}%`,
                         height: `${cropBox.height}%`,
                         touchAction: 'none',
+                        WebkitUserSelect: 'none',
+                        userSelect: 'none',
                     }}
                     onMouseDown={(e) => handleMouseDown(e, 'drag', pageEl)}
                     onTouchStart={(e) => handleTouchStart(e, 'drag')}
+                    onPointerDown={(e) => handlePointerDown(e, 'drag')}
+                    onTouchMove={handleTouchMove}
+                    onTouchEnd={handleTouchEnd}
                 >
                     {/* Grid lines */}
                     <div className="absolute inset-0 grid grid-cols-3 grid-rows-3 pointer-events-none">
@@ -445,17 +644,17 @@ const CropPDFPage = () => {
                         ))}
                     </div>
 
-                    {/* Corner handles */}
-                    <div className="absolute -top-3 -left-3 w-6 h-6 bg-primary border-2 border-white rounded-sm cursor-nw-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'nw', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'nw')} />
-                    <div className="absolute -top-3 -right-3 w-6 h-6 bg-primary border-2 border-white rounded-sm cursor-ne-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'ne', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'ne')} />
-                    <div className="absolute -bottom-3 -left-3 w-6 h-6 bg-primary border-2 border-white rounded-sm cursor-sw-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'sw', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'sw')} />
-                    <div className="absolute -bottom-3 -right-3 w-6 h-6 bg-primary border-2 border-white rounded-sm cursor-se-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'se', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'se')} />
+                    {/* Corner handles - larger touch targets for mobile */}
+                    <div className="absolute -top-4 -left-4 w-8 h-8 md:-top-3 md:-left-3 md:w-6 md:h-6 bg-primary border-2 border-white rounded-sm cursor-nw-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'nw', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'nw')} onPointerDown={(e) => handlePointerDown(e, 'nw')} />
+                    <div className="absolute -top-4 -right-4 w-8 h-8 md:-top-3 md:-right-3 md:w-6 md:h-6 bg-primary border-2 border-white rounded-sm cursor-ne-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'ne', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'ne')} onPointerDown={(e) => handlePointerDown(e, 'ne')} />
+                    <div className="absolute -bottom-4 -left-4 w-8 h-8 md:-bottom-3 md:-left-3 md:w-6 md:h-6 bg-primary border-2 border-white rounded-sm cursor-sw-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'sw', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'sw')} onPointerDown={(e) => handlePointerDown(e, 'sw')} />
+                    <div className="absolute -bottom-4 -right-4 w-8 h-8 md:-bottom-3 md:-right-3 md:w-6 md:h-6 bg-primary border-2 border-white rounded-sm cursor-se-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'se', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'se')} onPointerDown={(e) => handlePointerDown(e, 'se')} />
 
-                    {/* Edge handles */}
-                    <div className="absolute -top-2 left-1/2 -translate-x-1/2 w-10 h-4 bg-primary border-2 border-white rounded-sm cursor-n-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'n', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'n')} />
-                    <div className="absolute -bottom-2 left-1/2 -translate-x-1/2 w-10 h-4 bg-primary border-2 border-white rounded-sm cursor-s-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 's', pageEl)} onTouchStart={(e) => handleTouchStart(e, 's')} />
-                    <div className="absolute top-1/2 -left-2 -translate-y-1/2 w-4 h-10 bg-primary border-2 border-white rounded-sm cursor-w-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'w', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'w')} />
-                    <div className="absolute top-1/2 -right-2 -translate-y-1/2 w-4 h-10 bg-primary border-2 border-white rounded-sm cursor-e-resize" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'e', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'e')} />
+                    {/* Edge handles - larger touch targets for mobile */}
+                    <div className="absolute -top-3 left-1/2 -translate-x-1/2 w-12 h-6 md:-top-2 md:w-10 md:h-4 bg-primary border-2 border-white rounded-sm cursor-n-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'n', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'n')} onPointerDown={(e) => handlePointerDown(e, 'n')} />
+                    <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 w-12 h-6 md:-bottom-2 md:w-10 md:h-4 bg-primary border-2 border-white rounded-sm cursor-s-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 's', pageEl)} onTouchStart={(e) => handleTouchStart(e, 's')} onPointerDown={(e) => handlePointerDown(e, 's')} />
+                    <div className="absolute top-1/2 -left-3 -translate-y-1/2 w-6 h-12 md:-left-2 md:w-4 md:h-10 bg-primary border-2 border-white rounded-sm cursor-w-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'w', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'w')} onPointerDown={(e) => handlePointerDown(e, 'w')} />
+                    <div className="absolute top-1/2 -right-3 -translate-y-1/2 w-6 h-12 md:-right-2 md:w-4 md:h-10 bg-primary border-2 border-white rounded-sm cursor-e-resize select-none" style={{ touchAction: 'none' }} onMouseDown={(e) => handleMouseDown(e, 'e', pageEl)} onTouchStart={(e) => handleTouchStart(e, 'e')} onPointerDown={(e) => handlePointerDown(e, 'e')} />
                 </div>
             </div>
         );
@@ -671,7 +870,7 @@ const CropPDFPage = () => {
                                             <div
                                                 ref={index === 0 ? firstPageRef : undefined}
                                                 data-crop-page={pageImg.pageNum}
-                                                className="relative bg-white shadow-xl rounded-lg overflow-hidden"
+                                                className="relative bg-white shadow-xl rounded-lg overflow-visible"
                                                 style={{
                                                     maxWidth: '500px',
                                                     width: '100%',
@@ -682,7 +881,11 @@ const CropPDFPage = () => {
                                                     alt={`Page ${pageImg.pageNum}`}
                                                     className="w-full h-auto block"
                                                     draggable={false}
-                                                    onLoad={() => index === 0 && setPagesMounted(true)}
+                                                    onLoad={() => {
+                                                        if (index === 0) {
+                                                            setPagesMounted(true);
+                                                        }
+                                                    }}
                                                 />
                                                 {index === 0 && pagesMounted && (
                                                     <CropOverlay />
